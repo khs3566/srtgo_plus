@@ -1099,3 +1099,346 @@ class Korail:
     def clear(self):
         self._log("Clearing the netfunnel key")
         self._netfunnel.clear()
+
+# === KORAIL_MOBILE_API_COMPAT_PATCH_20261001 ===
+from korail_mobile_api import (
+    KorailClient as _KMAClient,
+    TrainSearchQuery as _KMATrainSearchQuery,
+    KorailPassengerCounts as _KMAPassengerCounts,
+    KorailSeatClass as _KMASeatClass,
+)
+from korail_mobile_api.mutation_models import CardPayment as _KMACardPayment
+
+try:
+    from korail_mobile_api import KorailSeatUnavailableError as _KMASeatUnavailableError
+except Exception:
+    _KMASeatUnavailableError = ()
+
+try:
+    from korail_mobile_api import KorailReservationRefusedError as _KMAReservationRefusedError
+except Exception:
+    _KMAReservationRefusedError = ()
+
+
+def _kma_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _kma_yes(value):
+    if value is None:
+        return False
+    text = str(value).strip().upper()
+    return text in {"Y", "1", "YES", "TRUE", "11", "가능", "예약가능"}
+
+
+def _kma_train_to_legacy(summary):
+    general_ok = (
+        _kma_yes(getattr(summary, "general_reservation_flag", None))
+        or str(getattr(summary, "general_reservation_code", "") or "") == "11"
+        or _kma_int(getattr(summary, "standard_remaining_seat_count", 0)) > 0
+        or "가능" in str(getattr(summary, "general_availability_name", "") or "")
+    )
+    special_ok = (
+        _kma_yes(getattr(summary, "special_reservation_flag", None))
+        or str(getattr(summary, "special_reservation_code", "") or "") == "11"
+        or _kma_int(getattr(summary, "first_class_remaining_seat_count", 0)) > 0
+        or "가능" in str(getattr(summary, "special_availability_name", "") or "")
+    )
+    wait_ok = _kma_yes(getattr(summary, "wait_reservation_flag", None))
+
+    data = {
+        "h_trn_clsf_cd": getattr(summary, "train_class_code", None) or "100",
+        "h_trn_clsf_nm": getattr(summary, "train_class_name", None) or "KTX",
+        "h_trn_gp_cd": getattr(summary, "train_group_code", None) or "100",
+        "h_trn_no": getattr(summary, "train_no", None) or "",
+        "h_expct_dlay_hr": "000000",
+        "h_dpt_rs_stn_nm": getattr(summary, "departure_station_name", None) or getattr(summary, "departure_station_code", None) or "",
+        "h_dpt_rs_stn_cd": getattr(summary, "departure_station_code", None) or "",
+        "h_dpt_dt": getattr(summary, "departure_date", None) or getattr(summary, "run_date", None) or "",
+        "h_dpt_tm": getattr(summary, "departure_time", None) or "",
+        "h_arv_rs_stn_nm": getattr(summary, "arrival_station_name", None) or getattr(summary, "arrival_station_code", None) or "",
+        "h_arv_rs_stn_cd": getattr(summary, "arrival_station_code", None) or "",
+        "h_arv_dt": getattr(summary, "arrival_date", None) or getattr(summary, "departure_date", None) or getattr(summary, "run_date", None) or "",
+        "h_arv_tm": getattr(summary, "arrival_time", None) or "",
+        "h_run_dt": getattr(summary, "run_date", None) or getattr(summary, "departure_date", None) or "",
+        "h_rsv_psb_flg": "Y" if (general_ok or special_ok) else "N",
+        "h_rsv_psb_nm": "예약가능" if (general_ok or special_ok) else "매진",
+        "h_spe_rsv_cd": "11" if special_ok else "00",
+        "h_gen_rsv_cd": "11" if general_ok else "00",
+        "h_wait_rsv_flg": "9" if wait_ok else "0",
+    }
+    train = Train(data)
+    train._kma_train = summary
+    return train
+
+
+def _kma_passengers(passengers):
+    passengers = passengers or [AdultPassenger()]
+    passengers = Passenger.reduce(passengers)
+    counts = dict(adult=0, teenager=0, child=0, infant=0, senior=0, severe_disability=0, mild_disability=0, guide_dog=0)
+    for p in passengers:
+        if isinstance(p, ToddlerPassenger):
+            counts["infant"] += p.count
+        elif isinstance(p, ChildPassenger):
+            counts["child"] += p.count
+        elif isinstance(p, SeniorPassenger):
+            counts["senior"] += p.count
+        elif isinstance(p, Disability1To3Passenger):
+            counts["severe_disability"] += p.count
+        elif isinstance(p, Disability4To6Passenger):
+            counts["mild_disability"] += p.count
+        elif isinstance(p, AdultPassenger):
+            counts["adult"] += p.count
+    if sum(counts.values()) == 0:
+        counts["adult"] = 1
+    return _KMAPassengerCounts(**counts)
+
+
+class _KMAReservationCompat:
+    def __init__(self, hold, train=None):
+        self._hold = hold
+        self._train = train
+        self.rsv_id = getattr(hold, "pnr_no", None)
+        self.pnr_no = self.rsv_id
+        self.price = _kma_int(getattr(hold, "received_amount", None) or getattr(hold, "total_price", None) or getattr(hold, "total_fare", None), 0)
+        self.buy_limit_date = getattr(hold, "payment_deadline_date", None) or ""
+        self.buy_limit_time = getattr(hold, "payment_deadline_time", None) or ""
+        self.is_waiting = not bool(getattr(hold, "payable", True))
+        self.tickets = []
+        self.paid = False
+        self.is_ticket = False
+    def __repr__(self):
+        parts = []
+        if self._train is not None:
+            parts.append(repr(self._train))
+        if self.rsv_id:
+            parts.append(f"예약번호 {self.rsv_id}")
+        if self.price:
+            parts.append(f"{self.price:,}원")
+        if self.buy_limit_date or self.buy_limit_time:
+            parts.append(f"결제기한 {self.buy_limit_date} {self.buy_limit_time}".strip())
+        if self.is_waiting:
+            parts.append("예약대기")
+        return ", ".join(parts) if parts else "KTX 예약"
+
+
+class _KMAHistoryCompat:
+    def __init__(self, pnr_no, text, paid=False):
+        self.rsv_id = pnr_no
+        self.pnr_no = pnr_no
+        self.paid = paid
+        self.is_ticket = paid
+        self.is_waiting = False
+        self.tickets = []
+        self._text = text
+    def __repr__(self):
+        return self._text or (f"예약번호 {self.pnr_no}" if self.pnr_no else "KTX 예약/승차권")
+
+
+class Korail:
+    def __init__(self, korail_id, korail_pw, auto_login=True, verbose=False):
+        self.korail_id = korail_id
+        self.korail_pw = korail_pw
+        self.verbose = verbose
+        self.logined = False
+        self.membership_number = None
+        self.name = None
+        self.email = None
+        self.phone_number = None
+        self._client = _KMAClient()
+        if auto_login:
+            self.login(korail_id, korail_pw)
+
+    def login(self, korail_id=None, korail_pw=None):
+        if korail_id:
+            self.korail_id = korail_id
+        if korail_pw:
+            self.korail_pw = korail_pw
+        try:
+            session = self._client.login(self.korail_id, self.korail_pw)
+            self.logined = True
+            self.membership_number = getattr(session, "member_no", None) or getattr(session, "customer_no", None) or self.korail_id
+            self.name = getattr(session, "customer_name", None) or getattr(session, "name", None)
+            self.phone_number = getattr(session, "phone_no", None) or getattr(session, "phone_number", None)
+            self.email = getattr(session, "email", None)
+            print(f"로그인 성공: {self.name or '회원'}")
+            return True
+        except Exception as exc:
+            self.logined = False
+            raise KorailError(str(exc))
+
+    def logout(self):
+        try:
+            self._client.logout()
+        finally:
+            self.logined = False
+
+    def clear(self):
+        try:
+            self._client.clear_session()
+        except Exception:
+            pass
+
+    def search_train(self, dep, arr, date=None, time=None, train_type=TrainType.ALL, passengers=None, include_no_seats=False, include_waiting_list=False):
+        now = datetime.now()
+        date = date or now.strftime("%Y%m%d")
+        time = time or now.strftime("%H%M%S")
+        pcounts = _kma_passengers(passengers)
+        query = _KMATrainSearchQuery(
+            departure_station_code=dep,
+            arrival_station_code=arr,
+            departure_date=date,
+            departure_time=time,
+            passengers=pcounts.total,
+            train_group_code=(train_type or "100"),
+            include_srt=False,
+            child_passengers=pcounts.child,
+            senior_passengers=pcounts.senior,
+            high_disability_passengers=pcounts.severe_disability,
+            low_disability_passengers=pcounts.mild_disability,
+            teenager_passengers=pcounts.teenager,
+            infant_passengers=pcounts.infant,
+            guide_dog_passengers=pcounts.guide_dog,
+        )
+        try:
+            result = self._client.search_trains(query)
+        except Exception as exc:
+            msg = str(exc)
+            if any(code in msg for code in ("P100", "WRG000000", "WRD000061", "WRT300005")):
+                raise NoResultsError()
+            raise KorailError(msg)
+        trains = [_kma_train_to_legacy(t) for t in result.trains]
+        trains = [
+            t for t in trains
+            if t.has_seat() or (include_waiting_list and t.has_waiting_list()) or include_no_seats
+        ]
+        if not trains:
+            raise NoResultsError()
+        return trains
+
+    def reserve(self, train, passengers=None, option=ReserveOption.GENERAL_FIRST):
+        summary = getattr(train, "_kma_train", None)
+        if summary is None:
+            raise KorailError("열차를 새 API로 다시 조회해 주세요.")
+        counts = _kma_passengers(passengers)
+        general_ok = train.has_general_seat()
+        special_ok = train.has_special_seat()
+        if option == ReserveOption.GENERAL_ONLY:
+            if not general_ok: raise SoldOutError()
+            seat_class = _KMASeatClass.GENERAL
+        elif option == ReserveOption.SPECIAL_ONLY:
+            if not special_ok: raise SoldOutError()
+            seat_class = _KMASeatClass.SPECIAL
+        elif option == ReserveOption.SPECIAL_FIRST:
+            if special_ok: seat_class = _KMASeatClass.SPECIAL
+            elif general_ok: seat_class = _KMASeatClass.GENERAL
+            else: raise SoldOutError()
+        else:
+            if general_ok: seat_class = _KMASeatClass.GENERAL
+            elif special_ok: seat_class = _KMASeatClass.SPECIAL
+            else: raise SoldOutError()
+        try:
+            hold = self._client.reserve(summary, passengers=counts, seat_class=seat_class)
+        except Exception as exc:
+            if (_KMASeatUnavailableError and isinstance(exc, _KMASeatUnavailableError)) or (_KMAReservationRefusedError and isinstance(exc, _KMAReservationRefusedError)):
+                raise SoldOutError()
+            msg = str(exc)
+            if any(word in msg.lower() for word in ("sold", "seat", "매진", "잔여")):
+                raise SoldOutError()
+            raise KorailError(msg)
+        if getattr(hold, "str_result", None) not in (None, "SUCC"):
+            raise KorailError(getattr(hold, "h_msg_txt", None) or "예약 실패", getattr(hold, "h_msg_cd", None))
+        if not getattr(hold, "pnr_no", None):
+            raise KorailError("예약 응답에 PNR이 없습니다.")
+        return _KMAReservationCompat(hold, train)
+
+    def pay_with_card(self, reservation, card_number, card_password, birthday, expire, installment=0, card_type="J"):
+        hold = getattr(reservation, "_hold", None)
+        if hold is None:
+            pnr_no = getattr(reservation, "pnr_no", None) or getattr(reservation, "rsv_id", None)
+            if not pnr_no:
+                raise KorailError("결제할 예약번호를 찾을 수 없습니다.")
+            hold = self._client.get_reservation_hold(pnr_no)
+        try:
+            card = _KMACardPayment(
+                card_number=str(card_number),
+                card_password=str(card_password),
+                card_expire=str(expire),
+                birthday=str(birthday),
+                installment=str(installment),
+                card_type=card_type,
+            )
+            result = self._client.pay_with_card(hold, card)
+        except Exception as exc:
+            raise KorailError(str(exc))
+        ok = getattr(result, "str_result", None) == "SUCC"
+        if ok:
+            reservation.paid = True
+        return ok
+
+    def reservations(self, rsv_id=None):
+        try:
+            hist = self._client.get_reservation_history()
+        except Exception as exc:
+            raise KorailError(str(exc))
+        out = []
+        for journey in getattr(hist, "journeys", ()) or ():
+            r = getattr(journey, "reservation", None)
+            if r is None:
+                continue
+            pnr = getattr(r, "pnr_no", None)
+            if rsv_id and pnr != rsv_id:
+                continue
+            trains = getattr(journey, "trains", ()) or ()
+            t = trains[0] if trains else None
+            if t is not None:
+                text = f"[{getattr(t,'train_class_name',None) or 'KTX'} {getattr(t,'train_no',None) or ''}] {getattr(t,'departure_station_name',None) or getattr(t,'departure_station_code',None) or ''}~{getattr(t,'arrival_station_name',None) or getattr(t,'arrival_station_code',None) or ''} {getattr(t,'departure_date',None) or ''} {getattr(t,'departure_time',None) or ''}"
+            else:
+                text = f"KTX 예약 {pnr or ''}"
+            amount = getattr(r, "total_received_amount", None) or getattr(r, "total_price", None)
+            if amount: text += f", {amount}원"
+            if pnr: text += f", 예약번호 {pnr}"
+            paid = str(getattr(r, "payment_flag", "") or "").upper() in {"Y", "1"}
+            out.append(_KMAHistoryCompat(pnr, text, paid=paid))
+        return out
+
+    def tickets(self):
+        try:
+            resp = self._client.get_ticket_list()
+        except Exception as exc:
+            raise KorailError(str(exc))
+        out = []
+        for reservation in getattr(resp, "reservations", ()) or ():
+            for ticket in getattr(reservation, "tickets", ()) or ():
+                trains = getattr(ticket, "trains", ()) or ()
+                t = trains[0] if trains else None
+                pnr = getattr(ticket, "pnr_no", None)
+                if t is not None:
+                    text = f"[{getattr(t,'train_class_name',None) or 'KTX'} {getattr(t,'train_no',None) or ''}] {getattr(t,'departure_station_name',None) or ''}~{getattr(t,'arrival_station_name',None) or ''} {getattr(t,'departure_date',None) or ''} {getattr(t,'departure_time',None) or ''}"
+                else:
+                    text = f"KTX 승차권 {pnr or ''}"
+                if pnr: text += f", 예약번호 {pnr}"
+                out.append(_KMAHistoryCompat(pnr, text, paid=True))
+        return out
+
+    def cancel(self, reservation):
+        pnr_no = getattr(reservation, "pnr_no", None) or getattr(reservation, "rsv_id", None)
+        if not pnr_no:
+            raise KorailError("취소할 예약번호를 찾을 수 없습니다.")
+        try:
+            hold = getattr(reservation, "_hold", None) or self._client.get_reservation_hold(pnr_no)
+            result = self._client.cancel_unpaid_hold(hold)
+            return getattr(result, "str_result", None) in (None, "SUCC")
+        except Exception as exc:
+            raise KorailError(str(exc))
+
+    def refund(self, ticket):
+        raise KorailError("자동 환불은 안전을 위해 이 호환 패치에서 비활성화했습니다.")
+
+    def ticket_info(self, ticket):
+        return ticket
