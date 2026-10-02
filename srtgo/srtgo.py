@@ -700,6 +700,7 @@ def reserve(rail_type="SRT", debug=False):
 
     # Reservation loop
     i_try = 0
+    net_fail = 0  # consecutive network (transport) failures
     start_time = time.time()
     while True:
         try:
@@ -714,6 +715,7 @@ def reserve(rail_type="SRT", debug=False):
             )
 
             trains = rail.search_train(**params)
+            net_fail = 0
             for i in choice["trains"]:
                 if _is_seat_available(trains[i], options["type"]):
                     _reserve(trains[i])
@@ -723,6 +725,23 @@ def reserve(rail_type="SRT", debug=False):
         except KorailError as ex:
             msg = ex.msg
             code = ex.code or ""
+            if "transport failed" in msg:
+                # Temporary network drop (LTE/5G handover, sleep, server hiccup):
+                # back off and retry on its own instead of stopping to ask.
+                net_fail += 1
+                wait = min(5 * net_fail, 60)
+                print(f"\n네트워크 오류 {net_fail}회 연속, {wait}초 후 자동 재시도")
+                time.sleep(wait)
+                if net_fail % 5 == 0:
+                    try:
+                        new_rail = login(rail_type, debug=debug)
+                    except KorailError:
+                        new_rail = rail  # still offline; keep the old session
+                    if new_rail is None:
+                        return
+                    rail = new_rail
+                continue
+            net_fail = 0
             if "MACRO" in code or "MACRO" in msg:
                 if debug:
                     print(
