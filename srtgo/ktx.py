@@ -1306,7 +1306,15 @@ class Korail:
             guide_dog_passengers=pcounts.guide_dog,
         )
         try:
-            result = self._client.search_trains(query)
+            try:
+                result = self._client.search_trains(query)
+            except Exception as first:
+                # The server sometimes drops the reused keep-alive connection between
+                # polls, so the next request fails instantly. Searching is read-only,
+                # so one immediate retry on a fresh connection is safe.
+                if "transport failed" not in str(first):
+                    raise
+                result = self._client.search_trains(query)
         except Exception as exc:
             msg = str(exc)
             if any(code in msg for code in ("P100", "WRG000000", "WRD000061", "WRT300005")):
