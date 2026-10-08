@@ -1250,6 +1250,12 @@ class Korail:
         self.name = None
         self.email = None
         self.phone_number = None
+        # NetFunnel (queue) hiccups are logged as warnings by the library even though
+        # the search itself goes through; only show them in debug mode.
+        import logging as _logging
+        _logging.getLogger("korail_mobile_api").setLevel(
+            _logging.WARNING if verbose else _logging.ERROR
+        )
         self._client = _KMAClient()
         if auto_login:
             self.login(korail_id, korail_pw)
