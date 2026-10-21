@@ -1116,9 +1116,31 @@ import os as _os
 _KMA_APP_VERSION = _os.environ.get("SRTGO_APP_VERSION", "7.0.10").strip() or "7.0.10"
 
 
-def _kma_new_client():
+# The separate API "Version" field (library default 250601003) may also be checked
+# by -8204. When it is rejected, srtgo bumps it and remembers the accepted value here.
+_KMA_API_VERSION_FILE = _os.path.expanduser("~/.srtgo_api_version")
+_KMA_API_VERSION_MAX_BUMPS = 8
+
+
+def _kma_saved_api_version():
+    env = _os.environ.get("SRTGO_API_VERSION", "").strip()
+    if env.isdigit():
+        return env
+    try:
+        with open(_KMA_API_VERSION_FILE, encoding="utf-8") as f:
+            saved = f.read().strip()
+        return saved if saved.isdigit() else None
+    except OSError:
+        return None
+
+
+def _kma_new_client(api_version=None):
     from korail_mobile_api import KorailConfig as _KMAConfig
-    return _KMAClient(_KMAConfig(app_version=_KMA_APP_VERSION))
+    kwargs = {"app_version": _KMA_APP_VERSION}
+    api_version = api_version or _kma_saved_api_version()
+    if api_version:
+        kwargs["version"] = api_version
+    return _KMAClient(_KMAConfig(**kwargs))
 
 try:
     from korail_mobile_api import KorailSeatUnavailableError as _KMASeatUnavailableError
@@ -1301,6 +1323,47 @@ class Korail:
         except Exception:
             pass
 
+    def _search_once(self, query):
+        try:
+            return self._client.search_trains(query)
+        except Exception as first:
+            # The server sometimes drops the reused keep-alive connection between
+            # polls, so the next request fails instantly. Searching is read-only,
+            # so one immediate retry on a fresh connection is safe.
+            if "transport failed" not in str(first):
+                raise
+            return self._client.search_trains(query)
+
+    def _search_with_version_probe(self, query):
+        bumps = 0
+        while True:
+            try:
+                result = self._search_once(query)
+            except Exception as exc:
+                if "-8204" not in str(exc) or bumps >= _KMA_API_VERSION_MAX_BUMPS:
+                    raise
+                # -8204 = "update the app". Try the next API Version on a fresh
+                # client; the session lives in the client, so log in again.
+                bumps += 1
+                new_version = str(int(self._client.config.version) + 1)
+                print(f"\n앱 버전 차단(-8204): API Version {new_version}(으)로 재시도 ({bumps}/{_KMA_API_VERSION_MAX_BUMPS})")
+                try:
+                    self._client.close()
+                except Exception:
+                    pass
+                self._client = _kma_new_client(api_version=new_version)
+                self.login(self.korail_id, self.korail_pw)
+                continue
+            if bumps:
+                accepted = self._client.config.version
+                print(f"API Version {accepted} 통과 - 다음 실행부터 자동으로 사용합니다")
+                try:
+                    with open(_KMA_API_VERSION_FILE, "w", encoding="utf-8") as f:
+                        f.write(accepted)
+                except OSError:
+                    pass
+            return result
+
     def search_train(self, dep, arr, date=None, time=None, train_type=TrainType.ALL, passengers=None, include_no_seats=False, include_waiting_list=False):
         now = datetime.now()
         date = date or now.strftime("%Y%m%d")
@@ -1323,15 +1386,7 @@ class Korail:
             guide_dog_passengers=pcounts.guide_dog,
         )
         try:
-            try:
-                result = self._client.search_trains(query)
-            except Exception as first:
-                # The server sometimes drops the reused keep-alive connection between
-                # polls, so the next request fails instantly. Searching is read-only,
-                # so one immediate retry on a fresh connection is safe.
-                if "transport failed" not in str(first):
-                    raise
-                result = self._client.search_trains(query)
+            result = self._search_with_version_probe(query)
         except Exception as exc:
             msg = str(exc)
             if any(code in msg for code in ("P100", "WRG000000", "WRD000061", "WRT300005")):
