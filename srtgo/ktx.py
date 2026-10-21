@@ -1109,6 +1109,17 @@ from korail_mobile_api import (
 )
 from korail_mobile_api.mutation_models import CardPayment as _KMACardPayment
 
+# Korail rejects outdated app versions with -8204 ("최신 버전으로 업데이트").
+# The library still defaults to 7.0.8, so report a newer one. Override without a
+# code change via:  export SRTGO_APP_VERSION=7.0.11
+import os as _os
+_KMA_APP_VERSION = _os.environ.get("SRTGO_APP_VERSION", "7.0.10").strip() or "7.0.10"
+
+
+def _kma_new_client():
+    from korail_mobile_api import KorailConfig as _KMAConfig
+    return _KMAClient(_KMAConfig(app_version=_KMA_APP_VERSION))
+
 try:
     from korail_mobile_api import KorailSeatUnavailableError as _KMASeatUnavailableError
 except Exception:
@@ -1256,7 +1267,7 @@ class Korail:
         _logging.getLogger("korail_mobile_api").setLevel(
             _logging.WARNING if verbose else _logging.ERROR
         )
-        self._client = _KMAClient()
+        self._client = _kma_new_client()
         if auto_login:
             self.login(korail_id, korail_pw)
 
