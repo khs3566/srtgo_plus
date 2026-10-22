@@ -1116,9 +1116,15 @@ import os as _os
 _KMA_APP_VERSION = _os.environ.get("SRTGO_APP_VERSION", "7.0.10").strip() or "7.0.10"
 
 
+# korail-mobile-api 2.6.2 changelog: the only combination observed to pass -8204 is
+# AppVersion 7.0.10 + Version 250722001 (with its new default DynaPath "2!" header).
+# The library keeps its old defaults, so set them here. Override via SRTGO_API_VERSION.
+_KMA_API_VERSION = _os.environ.get("SRTGO_API_VERSION", "250722001").strip() or "250722001"
+
+
 def _kma_new_client():
     from korail_mobile_api import KorailConfig as _KMAConfig
-    return _KMAClient(_KMAConfig(app_version=_KMA_APP_VERSION))
+    return _KMAClient(_KMAConfig(app_version=_KMA_APP_VERSION, version=_KMA_API_VERSION))
 
 try:
     from korail_mobile_api import KorailSeatUnavailableError as _KMASeatUnavailableError

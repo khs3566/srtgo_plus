@@ -24,7 +24,7 @@ dependencies = [
     "prompt_toolkit>=3",
     "python-telegram-bot",
     "termcolor",
-    "korail-mobile-api>=2.6.1"
+    "korail-mobile-api>=2.6.2"
 ]
 dynamic = ["version"]
 [tool.setuptools_scm]
