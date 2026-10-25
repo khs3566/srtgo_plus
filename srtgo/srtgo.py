@@ -105,10 +105,10 @@ DEFAULT_STATIONS = {
     "KTX": ["서울", "대전", "동대구", "부산"],
 }
 
-# 예약 간격 (평균 간격 (초) = SHAPE * SCALE + MIN): gamma distribution (~3.8 s)
+# 예약 간격 (평균 간격 (초) = SHAPE * SCALE + MIN): gamma distribution (~1.5 s)
 RESERVE_INTERVAL_SHAPE = 5
-RESERVE_INTERVAL_SCALE = 0.6
-RESERVE_INTERVAL_MIN = 0.8
+RESERVE_INTERVAL_SCALE = 0.2
+RESERVE_INTERVAL_MIN = 0.5
 
 WAITING_BAR = ["|", "/", "-", "\\"]
 
